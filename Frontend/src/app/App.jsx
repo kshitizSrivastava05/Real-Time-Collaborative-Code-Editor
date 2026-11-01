@@ -24,6 +24,125 @@ import {
   Shapes,
 } from "lucide-react";
 
+
+function SyncedWhiteboard({ ydoc }) {
+  const cleanupRef = useRef(null);
+
+  const handleMount = (editor) => {
+    cleanupRef.current?.();
+
+    const sharedRecords = ydoc.getMap("whiteboard");
+    const isDocumentRecord = (record) =>
+      record.typeName !== "instance" &&
+      record.typeName !== "instance_page_state" &&
+      record.typeName !== "camera";
+
+    const applyRemoteRecords = (records) => {
+      editor.store.mergeRemoteChanges(() => {
+        const toPut = [];
+        const toRemove = [];
+
+        records.forEach((change, id) => {
+          if (change.action === "delete") {
+            toRemove.push(id);
+          } else if (change.value) {
+            toPut.push(change.value);
+          }
+        });
+
+        if (toRemove.length) editor.store.remove(toRemove);
+        if (toPut.length) editor.store.put(toPut);
+      });
+    };
+
+    // Load existing shared canvas records, or seed a new room's canvas.
+    if (sharedRecords.size > 0) {
+      const initialRecords = new Map(
+        Array.from(sharedRecords.entries()).map(([id, value]) => [
+          id,
+          { action: "put", value },
+        ])
+      );
+      applyRemoteRecords(initialRecords);
+    } else {
+      const initialRecords = editor.store
+        .allRecords()
+        .filter(isDocumentRecord);
+
+      ydoc.transact(() => {
+        initialRecords.forEach((record) => {
+          sharedRecords.set(record.id, record);
+        });
+      });
+    }
+
+    const handleSharedRecords = (event, transaction) => {
+      console.log("[Whiteboard] Yjs map event received", {
+        local: transaction.local,
+        changes: Array.from(event.changes.keys.entries()),
+        mapSize: sharedRecords.size,
+      });
+
+      if (transaction.local) return;
+
+      const changes = new Map();
+
+      for (const [id, change] of event.changes.keys) {
+        const isDeleted = change.action === "delete";
+
+        changes.set(id, {
+          action: isDeleted ? "delete" : "put",
+          value: isDeleted ? null : sharedRecords.get(id),
+        });
+      }
+
+      console.log("[Whiteboard] Applying remote records", {
+        count: changes.size,
+      });
+      applyRemoteRecords(changes);
+    };
+
+    sharedRecords.observe(handleSharedRecords);
+
+    const stopListening = editor.store.listen(
+      ({ changes }) => {
+        console.log("[Whiteboard] Local tldraw change", {
+          added: Object.keys(changes.added),
+          updated: Object.keys(changes.updated),
+          removed: Object.keys(changes.removed),
+        });
+
+        ydoc.transact(() => {
+          Object.entries(changes.added).forEach(([id, record]) => {
+            if (isDocumentRecord(record)) sharedRecords.set(id, record);
+          });
+
+          Object.entries(changes.updated).forEach(([id, pair]) => {
+            const record = pair[1];
+            if (isDocumentRecord(record)) sharedRecords.set(id, record);
+          });
+
+          Object.keys(changes.removed).forEach((id) => {
+            sharedRecords.delete(id);
+          });
+        });
+      },
+      { scope: "document", source: "user" }
+    );
+
+    cleanupRef.current = () => {
+      stopListening();
+      sharedRecords.unobserve(handleSharedRecords);
+    };
+  };
+
+  useEffect(() => {
+    return () => cleanupRef.current?.();
+  }, []);
+
+  return <Tldraw onMount={handleMount} />;
+}
+
 function App() {
   const roomId = new URLSearchParams(window.location.search).get("room");
 
@@ -837,7 +956,7 @@ function App() {
               </>
             ) : (
               <div className="min-h-0 flex-1 bg-white">
-                <Tldraw />
+                <SyncedWhiteboard ydoc={ydocRef.current} />
               </div>
             )}
           </div>
