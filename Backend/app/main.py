@@ -5,7 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.websockets.server import websocket_server, websocket_asgi_app
 # Import the room creation and validation functions
-from app.rooms.router import APIRouter , room_router
+from app.rooms.router import  room_router
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
@@ -35,11 +36,13 @@ async def home():
 async def health():
     return {"status": "healthy"}
 
-# Mount the WebSocket synchronization server
-app.mount("/ws", websocket_asgi_app)
+# Import the WebSocket room validation application
+from app.websockets.room_validation import room_validation_app
+
+# Mount the validated WebSocket application
+app.mount("/ws", room_validation_app)
 # app is your main FastAPI application.
 # /ws is the URL prefix for WebSocket connections.
-# websocket_asgi_app handles the actual WebSocket communication.
 
 
 app.include_router(room_router)
