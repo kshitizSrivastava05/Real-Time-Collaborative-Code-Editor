@@ -7,6 +7,7 @@ import "tldraw/tldraw.css";
 import * as Y from "yjs";
 import { WebsocketProvider } from "y-websocket";
 import { MonacoBinding } from "y-monaco";
+import { removeAwarenessStates } from "y-protocols/awareness.js";
 import {
   Code2,
   PlusSquare,
@@ -18,6 +19,11 @@ import {
   Trash2,
   Shapes,
   Plus,
+  Play,
+  TerminalSquare,
+  X,
+  LoaderCircle,
+  Users,
 } from "lucide-react";
 
 function destroyMonacoBinding(bindingRef) {
@@ -135,20 +141,137 @@ function SyncedWhiteboard({ ydoc }) {
 
 
 
-const SAVED_ROOMS_KEY = "colab.savedRooms.v1";
 
-function readSavedRooms() {
+const GUEST_IDENTITY_KEY = "colab.guestIdentity.v1";
+
+function buildRemoteCursorStyles(participants) {
+  return participants
+    .map((participant) => {
+      const clientId = Number(participant.clientId);
+      if (!Number.isSafeInteger(clientId) || clientId < 0) return "";
+
+      const color = /^#[0-9a-fA-F]{6}$/.test(participant.color)
+        ? participant.color
+        : "#64748B";
+
+      const safeName = String(participant.name || "Collaborator")
+        .replace(/[^a-zA-Z0-9 _.-]/g, "")
+        .slice(0, 32) || "Collaborator";
+
+      const cursorClass = `.yRemoteSelectionHead-${clientId}`;
+      const selectionClass = `.yRemoteSelection-${clientId}`;
+
+      return `
+        ${selectionClass} {
+          background-color: ${color}38;
+          border-bottom: 1px solid ${color}88;
+          border-radius: 2px;
+        }
+
+        ${cursorClass} {
+          position: absolute;
+          box-sizing: border-box;
+          height: 100%;
+          border-left: 2px solid ${color};
+          border-top: 1px solid ${color};
+          border-bottom: 1px solid ${color};
+          pointer-events: none;
+          z-index: 10;
+        }
+
+        ${cursorClass}::after {
+          content: "${safeName}";
+          position: absolute;
+          left: -2px;
+          top: -19px;
+          max-width: 150px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          border-radius: 3px 3px 3px 0;
+          padding: 2px 6px;
+          background: ${color};
+          color: #ffffff;
+          font: 600 10px/14px Inter, ui-sans-serif, system-ui, sans-serif;
+          letter-spacing: 0.01em;
+          pointer-events: none;
+          z-index: 20;
+        }
+      `;
+    })
+    .join("\n");
+}
+
+function getGuestIdentity() {
   try {
-    const rooms = JSON.parse(localStorage.getItem(SAVED_ROOMS_KEY) || "[]");
-    return Array.isArray(rooms) ? rooms : [];
+    const savedIdentity = sessionStorage.getItem(GUEST_IDENTITY_KEY);
+    if (savedIdentity) {
+      return JSON.parse(savedIdentity);
+    }
   } catch {
-    return [];
+    // Continue by creating a temporary identity.
+  }
+
+  const colors = [
+    "#2563EB",
+    "#7C3AED",
+    "#0F766E",
+    "#C2410C",
+    "#BE185D",
+    "#4D7C0F",
+  ];
+
+  const randomId =
+    typeof crypto !== "undefined" && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const identity = {
+    id: `guest-${randomId}`,
+    name: `Guest ${Math.floor(1000 + Math.random() * 9000)}`,
+    color: colors[Math.floor(Math.random() * colors.length)],
+  };
+
+  try {
+    sessionStorage.setItem(GUEST_IDENTITY_KEY, JSON.stringify(identity));
+  } catch {
+    // Presence still works for this page session without storage.
+  }
+
+  return identity;
+}
+
+
+const LOCAL_PROFILE_KEY = "colab.localProfile.v1";
+
+function getLocalProfileId() {
+  try {
+    let profileId = localStorage.getItem(LOCAL_PROFILE_KEY);
+
+    if (!profileId) {
+      profileId =
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      localStorage.setItem(LOCAL_PROFILE_KEY, profileId);
+    }
+
+    return profileId;
+  } catch {
+    throw new Error(
+      "Unable to access this browser's local profile. Enable local storage and try again."
+    );
   }
 }
 
-function writeSavedRooms(rooms) {
-  localStorage.setItem(SAVED_ROOMS_KEY, JSON.stringify(rooms));
+function getRoomRequestHeaders(json = false) {
+  return {
+    "X-Guest-ID": getLocalProfileId(),
+    ...(json ? { "Content-Type": "application/json" } : {}),
+  };
 }
+
 
 function App() {
   const roomId = new URLSearchParams(window.location.search).get("room");
@@ -158,15 +281,24 @@ function App() {
   const [editorReady, setEditorReady] = useState(false);
   const [yjsReady, setYjsReady] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState("Connecting");
+  const [participants, setParticipants] = useState([]);
   const [creatingRoom, setCreatingRoom] = useState(false);
   const [newRoomName, setNewRoomName] = useState("");
-  const [savedRooms, setSavedRooms] = useState(() => readSavedRooms());
+  const [createdRooms, setCreatedRooms] = useState([]);
+  const [savedRooms, setSavedRooms] = useState([]);
+  const [roomsLoading, setRoomsLoading] = useState(false);
+  const [roomsLastUpdated, setRoomsLastUpdated] = useState(null);
   const [roomActionLoading, setRoomActionLoading] = useState("");
   const [joiningRoom, setJoiningRoom] = useState(false);
   const [joinRoomId, setJoinRoomId] = useState("");
   const [actionError, setActionError] = useState("");
   const [copied, setCopied] = useState(false);
   const [activeWorkspace, setActiveWorkspace] = useState("editor");
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [stdinInput, setStdinInput] = useState("");
+  const [runOutput, setRunOutput] = useState(null);
+  const [runError, setRunError] = useState("");
+  const [isRunning, setIsRunning] = useState(false);
 
   const [files, setFiles] = useState([]);
 
@@ -180,6 +312,8 @@ function App() {
   const modelsRef = useRef(new Map());
   const ydocRef = useRef(null);
   const providerRef = useRef(null);
+  const guestIdentityRef = useRef(null);
+  const [editorFocused, setEditorFocused] = useState(false);
 
   const activeFile = files.find((file) => file.id === activeFileId);
 
@@ -267,9 +401,63 @@ function App() {
     }
   };
 
-  const saveRoomList = (nextRooms) => {
-    setSavedRooms(nextRooms);
-    writeSavedRooms(nextRooms);
+
+  const refreshRoomLists = async (showLoading = false) => {
+    if (showLoading) setRoomsLoading(true);
+
+    try {
+      const headers = getRoomRequestHeaders();
+      const [createdResponse, savedResponse] = await Promise.all([
+        fetch("http://127.0.0.1:8000/rooms/created", {
+          headers,
+          cache: "no-store",
+        }),
+        fetch("http://127.0.0.1:8000/rooms/saved", {
+          headers,
+          cache: "no-store",
+        }),
+      ]);
+
+      const [createdData, savedData] = await Promise.all([
+        createdResponse.json().catch(() => ({})),
+        savedResponse.json().catch(() => ({})),
+      ]);
+
+      if (!createdResponse.ok || !savedResponse.ok) {
+        const errorMessage =
+          createdData.detail ||
+          savedData.detail ||
+          `Could not load room lists (created: ${createdResponse.status}, saved: ${savedResponse.status}).`;
+        throw new Error(errorMessage);
+      }
+
+      setCreatedRooms(
+        Array.isArray(createdData.rooms) ? createdData.rooms : []
+      );
+      setSavedRooms(
+        Array.isArray(savedData.rooms) ? savedData.rooms : []
+      );
+      setRoomsLastUpdated(new Date());
+      setActionError("");
+
+      return true;
+    } catch (error) {
+      setActionError(error.message || "Unable to refresh your room lists.");
+      return false;
+    } finally {
+      if (showLoading) setRoomsLoading(false);
+    }
+  };
+
+  const notifyRoomListsChanged = () => {
+    try {
+      localStorage.setItem(
+        "colab.rooms.changed",
+        `${Date.now()}-${Math.random().toString(16).slice(2)}`
+      );
+    } catch {
+      // Cross-tab notification is an enhancement; periodic refresh still works.
+    }
   };
 
   const handleCreateRoom = async (event) => {
@@ -287,30 +475,20 @@ function App() {
 
       const response = await fetch("http://127.0.0.1:8000/rooms/", {
         method: "POST",
+        headers: getRoomRequestHeaders(true),
+        body: JSON.stringify({ name: roomName }),
       });
 
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error("Unable to create room");
+        throw new Error(data.detail || "Unable to create room.");
       }
 
-      const data = await response.json();
-      const now = new Date().toISOString();
-      const room = {
-        roomId: data.room_id,
-        name: roomName,
-        role: "created",
-        createdAt: now,
-        lastOpenedAt: now,
-      };
-
-      saveRoomList([
-        room,
-        ...savedRooms.filter((item) => item.roomId !== room.roomId),
-      ]);
-
+      await refreshRoomLists();
+      notifyRoomListsChanged();
       window.location.href = `/?room=${encodeURIComponent(data.room_id)}`;
     } catch (error) {
-      setActionError(error.message || "Something went wrong");
+      setActionError(error.message || "Something went wrong.");
       setCreatingRoom(false);
     }
   };
@@ -329,31 +507,22 @@ function App() {
       setActionError("");
 
       const response = await fetch(
-        `http://127.0.0.1:8000/rooms/${encodeURIComponent(id)}`
+        `http://127.0.0.1:8000/rooms/${encodeURIComponent(id)}/join`,
+        {
+          method: "POST",
+          headers: getRoomRequestHeaders(),
+        }
       );
 
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error("Room not found. Check the room ID and try again.");
+        throw new Error(
+          data.detail || "Room not found. Check the room ID and try again."
+        );
       }
 
-      await response.json();
-      const existingRoom = savedRooms.find((room) => room.roomId === id);
-      const now = new Date().toISOString();
-      const roomEntry = existingRoom
-        ? { ...existingRoom, lastOpenedAt: now }
-        : {
-            roomId: id,
-            name: `Room ${id.slice(0, 6)}`,
-            role: "joined",
-            createdAt: now,
-            lastOpenedAt: now,
-          };
-
-      saveRoomList([
-        roomEntry,
-        ...savedRooms.filter((room) => room.roomId !== id),
-      ]);
-
+      await refreshRoomLists();
+      notifyRoomListsChanged();
       window.location.href = `/?room=${encodeURIComponent(id)}`;
     } catch (error) {
       setActionError(error.message || "Unable to join this room.");
@@ -361,44 +530,69 @@ function App() {
     }
   };
 
-  const handleOpenSavedRoom = (room) => {
-    const now = new Date().toISOString();
-    saveRoomList(
-      savedRooms.map((item) =>
-        item.roomId === room.roomId
-          ? { ...item, lastOpenedAt: now }
-          : item
-      )
-    );
-    window.location.href = `/?room=${encodeURIComponent(room.roomId)}`;
+  const handleOpenRoom = (room) => {
+    window.location.href = `/?room=${encodeURIComponent(room.room_id)}`;
   };
 
-
-  const handleDeleteSavedRoom = async (room) => {
+  const handleDeleteOwnedRoom = async (room) => {
     const confirmed = window.confirm(
-      `Delete "${room.name}" from the server? This makes the room unavailable to everyone.`
+      `Delete "${room.name}" permanently? This deletes the source room for everyone and cannot be undone.`
     );
     if (!confirmed) return;
 
-    setRoomActionLoading(room.roomId);
+    setRoomActionLoading(room.room_id);
     setActionError("");
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/rooms/${encodeURIComponent(room.roomId)}`,
-        { method: "DELETE" }
+        `http://127.0.0.1:8000/rooms/${encodeURIComponent(room.room_id)}`,
+        {
+          method: "DELETE",
+          headers: getRoomRequestHeaders(),
+        }
       );
 
+      const body = await response.json().catch(() => ({}));
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
         throw new Error(body.detail || "The server could not delete this room.");
       }
 
-      saveRoomList(
-        savedRooms.filter((item) => item.roomId !== room.roomId)
-      );
+      await refreshRoomLists();
+      notifyRoomListsChanged();
     } catch (error) {
       setActionError(error.message || "Unable to delete this room.");
+    } finally {
+      setRoomActionLoading("");
+    }
+  };
+
+  const handleRemoveSavedRoom = async (room) => {
+    const confirmed = window.confirm(
+      `Remove "${room.name}" from your Saved Rooms? The room will remain available to its owner and other members.`
+    );
+    if (!confirmed) return;
+
+    setRoomActionLoading(room.room_id);
+    setActionError("");
+
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:8000/rooms/${encodeURIComponent(room.room_id)}/saved`,
+        {
+          method: "DELETE",
+          headers: getRoomRequestHeaders(),
+        }
+      );
+
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.detail || "Unable to remove this saved room.");
+      }
+
+      await refreshRoomLists();
+      notifyRoomListsChanged();
+    } catch (error) {
+      setActionError(error.message || "Unable to remove this saved room.");
     } finally {
       setRoomActionLoading("");
     }
@@ -421,6 +615,98 @@ function App() {
       setActionError("Unable to copy room ID. Please copy it manually.");
     }
   };
+
+  useEffect(() => {
+    if (roomId) return;
+
+    let cancelled = false;
+    let requestInProgress = false;
+
+    const loadRoomLists = async (showLoading = false) => {
+      if (requestInProgress || cancelled) return;
+      requestInProgress = true;
+
+      if (showLoading) setRoomsLoading(true);
+
+      try {
+        const headers = getRoomRequestHeaders();
+        const [createdResponse, savedResponse] = await Promise.all([
+          fetch("http://127.0.0.1:8000/rooms/created", {
+            headers,
+            cache: "no-store",
+          }),
+          fetch("http://127.0.0.1:8000/rooms/saved", {
+            headers,
+            cache: "no-store",
+          }),
+        ]);
+
+        const [createdData, savedData] = await Promise.all([
+          createdResponse.json().catch(() => ({})),
+          savedResponse.json().catch(() => ({})),
+        ]);
+
+        if (!createdResponse.ok || !savedResponse.ok) {
+          throw new Error(
+            createdData.detail ||
+              savedData.detail ||
+              `Room list request failed (created: ${createdResponse.status}, saved: ${savedResponse.status}).`
+          );
+        }
+
+        if (!cancelled) {
+          setCreatedRooms(
+            Array.isArray(createdData.rooms) ? createdData.rooms : []
+          );
+          setSavedRooms(
+            Array.isArray(savedData.rooms) ? savedData.rooms : []
+          );
+          setRoomsLastUpdated(new Date());
+          setActionError("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setActionError(error.message || "Unable to load your rooms.");
+        }
+      } finally {
+        requestInProgress = false;
+        if (showLoading && !cancelled) setRoomsLoading(false);
+      }
+    };
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") {
+        loadRoomLists(false);
+      }
+    };
+
+    const refreshAfterLocalChange = () => loadRoomLists(false);
+
+    loadRoomLists(true);
+
+    // Keep the landing page in sync with joins/removals/deletions from other
+    // tabs, browser profiles, or collaborators. Polling also covers other
+    // browsers where BroadcastChannel/storage events cannot be shared.
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        loadRoomLists(false);
+      }
+    }, 3000);
+
+    window.addEventListener("focus", refreshWhenVisible);
+    window.addEventListener("storage", refreshAfterLocalChange);
+    window.addEventListener("colab:rooms-changed", refreshAfterLocalChange);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", refreshWhenVisible);
+      window.removeEventListener("storage", refreshAfterLocalChange);
+      window.removeEventListener("colab:rooms-changed", refreshAfterLocalChange);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+  }, [roomId]);
 
   useEffect(() => {
     if (!roomId) {
@@ -466,7 +752,87 @@ function App() {
   const handleEditorMount = (editor, monacoInstance) => {
     editorRef.current = editor;
     monacoRef.current = monacoInstance;
+
+    editor.onDidFocusEditorText(() => {
+      setEditorFocused(true);
+    });
+
+    editor.onDidBlurEditorText(() => {
+      setEditorFocused(false);
+    });
+
     setEditorReady(true);
+  };
+
+  const handleRunCode = async () => {
+    setTerminalOpen(true);
+    setRunError("");
+    setRunOutput(null);
+
+    const language = activeFile?.language;
+    const supportedLanguages = ["python", "java", "javascript"];
+
+    if (!supportedLanguages.includes(language)) {
+      setRunError(
+        `Running ${language || "this file type"} is not supported yet. Supported languages: Python, Java and JavaScript.`
+      );
+      return;
+    }
+
+    const sourceExtension = activeFile?.name?.split(".").pop()?.toLowerCase();
+    const expectedExtension = {
+      python: "py",
+      java: "java",
+      javascript: "js",
+    }[language];
+
+    if (sourceExtension !== expectedExtension) {
+      setRunError(
+        `The ${language} runner requires a .${expectedExtension} file.`
+      );
+      return;
+    }
+
+    const currentCode = editorRef.current?.getValue();
+
+    if (!currentCode?.trim()) {
+      setRunError("There is no code to run.");
+      return;
+    }
+
+    setIsRunning(true);
+
+    try {
+      const response = await fetch("http://127.0.0.1:8000/execute", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          language,
+          filename: activeFile.name,
+          code: currentCode,
+          stdin: stdinInput,
+        }),
+      });
+
+      const result = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || result.message || "Code execution failed."
+        );
+      }
+
+      setRunOutput(result);
+    } catch (error) {
+      setRunError(
+        error.message ||
+          "Could not connect to the execution service. Check that FastAPI and Docker are running."
+      );
+    } finally {
+      setIsRunning(false);
+    }
   };
 
   useEffect(() => {
@@ -484,6 +850,77 @@ function App() {
 
     const yfiles = ydoc.getMap("files");
     const legacyText = ydoc.getText("monaco");
+    const awareness = provider.awareness;
+    const savedGuestIdentity = getGuestIdentity();
+    const guestIdentity = {
+      ...savedGuestIdentity,
+      sessionId:
+        typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      connectedAt: Date.now(),
+    };
+    guestIdentityRef.current = guestIdentity;
+
+    awareness.setLocalStateField("user", guestIdentity);
+
+    const syncParticipants = () => {
+      const participantsByUser = new Map();
+
+      for (const [clientId, state] of awareness.getStates().entries()) {
+        if (!state?.user?.id || !state?.user?.name) continue;
+
+        const activity = state.activity || {};
+        const participant = {
+          clientId,
+          id: state.user.id,
+          name: state.user.name,
+          color: state.user.color || "#64748B",
+          activityLabel: activity.label || "In this room",
+          connectedAt: Number(state.user.connectedAt) || 0,
+        };
+
+        const existing = participantsByUser.get(participant.id);
+        const isCurrentClient = clientId === awareness.clientID;
+        const existingIsCurrentClient =
+          existing?.clientId === awareness.clientID;
+
+        // A refresh creates a new Yjs clientID but retains the same guest user ID.
+        // Prefer this page's own entry, otherwise keep the newest session entry.
+        if (
+          !existing ||
+          isCurrentClient ||
+          (!existingIsCurrentClient &&
+            participant.connectedAt > existing.connectedAt)
+        ) {
+          participantsByUser.set(participant.id, participant);
+        }
+      }
+
+      setParticipants(
+        Array.from(participantsByUser.values()).sort((a, b) =>
+          a.name.localeCompare(b.name)
+        )
+      );
+    };
+
+    awareness.on("change", syncParticipants);
+    syncParticipants();
+
+    let awarenessRemovedOnExit = false;
+    const removeCurrentAwareness = () => {
+      if (awarenessRemovedOnExit) return;
+      awarenessRemovedOnExit = true;
+
+      removeAwarenessStates(
+        awareness,
+        [ydoc.clientID],
+        "co.lab page exit"
+      );
+    };
+
+    window.addEventListener("beforeunload", removeCurrentAwareness);
+    window.addEventListener("pagehide", removeCurrentAwareness);
 
     ydocRef.current = ydoc;
     providerRef.current = provider;
@@ -544,6 +981,11 @@ function App() {
       provider.off("sync", handleSync);
       provider.off("status", handleStatus);
       yfiles.unobserve(syncFiles);
+      awareness.off("change", syncParticipants);
+
+      window.removeEventListener("beforeunload", removeCurrentAwareness);
+      window.removeEventListener("pagehide", removeCurrentAwareness);
+      removeCurrentAwareness();
 
       destroyMonacoBinding(bindingRef);
 
@@ -553,11 +995,41 @@ function App() {
       provider.destroy();
       ydoc.destroy();
 
+      setParticipants([]);
+      guestIdentityRef.current = null;
+      setEditorFocused(false);
       setYjsReady(false);
       ydocRef.current = null;
       providerRef.current = null;
     };
   }, [roomValid, editorReady, roomId]);
+
+  useEffect(() => {
+    if (!yjsReady || !providerRef.current || !activeFile) return;
+
+    const awareness = providerRef.current.awareness;
+    const activityLabel =
+      activeWorkspace === "whiteboard"
+        ? "Viewing whiteboard"
+        : `${editorFocused ? "Editing" : "Viewing"} ${activeFile.name}`;
+
+    awareness.setLocalStateField("activity", {
+      workspace: activeWorkspace,
+      fileId: activeWorkspace === "editor" ? activeFile.id : null,
+      fileName: activeWorkspace === "editor" ? activeFile.name : null,
+      mode:
+        activeWorkspace === "editor" && editorFocused
+          ? "editing"
+          : "viewing",
+      label: activityLabel,
+    });
+  }, [
+    yjsReady,
+    activeWorkspace,
+    activeFileId,
+    activeFile?.name,
+    editorFocused,
+  ]);
 
   useEffect(() => {
     if (
@@ -697,55 +1169,155 @@ function App() {
             )}
           </section>
 
-          <section id="your-rooms" className="border-t border-slate-200 pt-6">
-            <div className="flex items-center justify-between">
-              <h2 className="font-semibold">Saved rooms</h2>
-              <span className="text-sm text-slate-500">
-                {savedRooms.length}
-              </span>
+          <section className="border-t border-slate-200 pt-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-semibold">Your Rooms</h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Rooms you created. You are the owner and can delete the source room.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
+                  {createdRooms.length} created
+                </span>
+                <span className="text-[11px] text-emerald-700">Live updates</span>
+              </div>
             </div>
-            <p className="mt-1 text-xs text-slate-500">
-              This list is stored in this browser.
-            </p>
 
-            {savedRooms.length === 0 ? (
-              <p className="mt-4 rounded-md border border-dashed border-slate-300 p-6 text-center text-sm text-slate-500">
-                No saved rooms. Create or join a room to get started.
+            {roomsLoading ? (
+              <p className="mt-4 rounded-md border border-slate-200 bg-white p-4 text-sm text-slate-500">
+                Loading your rooms...
+              </p>
+            ) : createdRooms.length === 0 ? (
+              <p className="mt-4 rounded-md border border-dashed border-slate-300 p-5 text-sm text-slate-500">
+                You haven't created any rooms yet. Create a room above to see it here.
               </p>
             ) : (
               <div className="mt-3 divide-y divide-slate-200 rounded-lg border border-slate-200 bg-white">
-                {savedRooms.map((room) => (
+                {createdRooms.map((room) => (
                   <div
-                    key={room.roomId}
+                    key={room.room_id}
                     className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
                   >
-                    <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{room.name}</p>
-                      <p className="truncate font-mono text-xs text-slate-500">
-                        {room.roomId}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="truncate text-sm font-medium">{room.name}</p>
+                        <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-medium text-blue-700">
+                          Owner
+                        </span>
+                      </div>
+                      <p className="mt-1 truncate font-mono text-xs text-slate-500">
+                        {room.room_id}
+                        <span className="ml-2 font-sans">
+                          · {room.member_count ?? 1} members
+                        </span>
                       </p>
                     </div>
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => handleOpenSavedRoom(room)}
+                        onClick={() => handleOpenRoom(room)}
                         className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
                       >
                         Open
                       </button>
                       <button
                         type="button"
-                        onClick={() => handleDeleteSavedRoom(room)}
-                        disabled={roomActionLoading === room.roomId}
-                        className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                        onClick={() => handleDeleteOwnedRoom(room)}
+                        disabled={roomActionLoading === room.room_id}
+                        title="Permanently delete this room for everyone"
+                        className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
                       >
-                        {roomActionLoading === room.roomId ? "Deleting..." : "Delete"}
+                        {roomActionLoading === room.room_id ? "Deleting..." : "Delete room"}
                       </button>
                     </div>
                   </div>
                 ))}
               </div>
             )}
+
+            <div className="mt-2 rounded-md bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-800">
+              <strong>Delete room:</strong> permanently removes the source room. Other members will no longer be able to access it.
+            </div>
+          </section>
+
+          <section className="mt-8 border-t border-slate-200 pt-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="font-semibold">Saved Rooms</h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Rooms you joined using a room ID or invite.
+                  {roomsLastUpdated && (
+                    <span className="ml-2 text-emerald-700">
+                      Updated {roomsLastUpdated.toLocaleTimeString()}
+                    </span>
+                  )}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">
+                  {savedRooms.length} saved
+                </span>
+                <span className="text-[11px] text-emerald-700">Live updates</span>
+              </div>
+            </div>
+
+            {roomsLoading ? (
+              <p className="mt-4 rounded-md border border-slate-200 bg-white p-4 text-sm text-slate-500">
+                Loading saved rooms...
+              </p>
+            ) : savedRooms.length === 0 ? (
+              <p className="mt-4 rounded-md border border-dashed border-slate-300 p-5 text-sm text-slate-500">
+                No saved rooms yet. Join someone else's room and it will appear here.
+              </p>
+            ) : (
+              <div className="mt-3 divide-y divide-slate-200 rounded-lg border border-slate-200 bg-white">
+                {savedRooms.map((room) => (
+                  <div
+                    key={room.room_id}
+                    className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="truncate text-sm font-medium">{room.name}</p>
+                        <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                          Joined
+                        </span>
+                      </div>
+                      <p className="mt-1 truncate font-mono text-xs text-slate-500">
+                        {room.room_id}
+                        <span className="ml-2 font-sans">
+                          · {room.member_count ?? 1} members
+                        </span>
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleOpenRoom(room)}
+                        className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+                      >
+                        Open
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveSavedRoom(room)}
+                        disabled={roomActionLoading === room.room_id}
+                        title="Remove only from your Saved Rooms list"
+                        className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+                      >
+                        {roomActionLoading === room.room_id ? "Removing..." : "Remove"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+              <strong>Remove from Saved Rooms:</strong> only removes the room from your list. It does not delete the source room or remove other members.
+            </div>
           </section>
         </div>
       </main>
@@ -780,7 +1352,23 @@ function App() {
   }
 
   return (
-    <main className="flex h-screen flex-col bg-slate-100 p-2 text-slate-900 sm:p-3">
+    <>
+      <style>{`
+        .yRemoteSelection {
+          border-radius: 2px;
+        }
+
+        .yRemoteSelectionHead {
+          position: absolute;
+          box-sizing: border-box;
+          height: 100%;
+          pointer-events: none;
+        }
+
+        ${buildRemoteCursorStyles(participants)}
+      `}</style>
+
+      <main className="flex h-screen flex-col bg-slate-100 p-2 text-slate-900 sm:p-3">
       <header className="mb-2 flex shrink-0 flex-wrap items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2">
         <div className="flex items-center gap-3">
           <button
@@ -800,6 +1388,35 @@ function App() {
           <span className="rounded-md bg-slate-100 px-3 py-2 font-mono">
             {roomId}
           </span>
+
+          <div
+            className="flex items-center gap-2 rounded-md px-2 py-1.5"
+            title={participants.map((participant) => participant.name).join(", ")}
+            aria-label={`${participants.length} participants online`}
+          >
+            <div className="flex items-center -space-x-2">
+              {participants.slice(0, 4).map((participant) => (
+                <span
+                  key={participant.clientId}
+                  title={participant.name}
+                  className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white text-[10px] font-semibold text-white"
+                  style={{ backgroundColor: participant.color }}
+                >
+                  {participant.name.slice(0, 1).toUpperCase()}
+                </span>
+              ))}
+              {participants.length > 4 && (
+                <span className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-white bg-slate-600 text-[10px] font-semibold text-white">
+                  +{participants.length - 4}
+                </span>
+              )}
+            </div>
+            <span className="flex items-center gap-1 text-xs text-slate-600">
+              <Users size={14} />
+              {participants.length} online
+            </span>
+          </div>
+
           <span className="flex items-center gap-2 rounded-md px-2 py-2 text-slate-600">
             <Circle
               size={8}
@@ -820,100 +1437,165 @@ function App() {
 
       <section className="flex min-h-0 flex-1 overflow-hidden rounded-md border border-slate-200 bg-white">
         <aside className="hidden w-56 shrink-0 flex-col border-r border-slate-200 bg-slate-50 md:flex">
-          <div className="flex items-center justify-between border-b border-slate-200 px-3 py-3">
-            <span className="text-xs font-semibold text-slate-600">FILES</span>
-            <button
-              onClick={() => {
-                setShowFileInput(true);
-                setActionError("");
-              }}
-              className="rounded p-1 text-slate-600 hover:bg-slate-200"
-              title="Create file"
-            >
-              <PlusSquare size={16} />
-            </button>
-          </div>
-
-          <div className="flex min-h-0 flex-1 flex-col p-2">
-            {showFileInput && (
-              <form
-                className="mb-2 space-y-2"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  handleCreateFile();
+          <section className="flex min-h-0 flex-1 flex-col border-b border-slate-200">
+            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-3 py-3">
+              <span className="text-xs font-semibold text-slate-600">PROJECT FILES</span>
+              <button
+                onClick={() => {
+                  setShowFileInput(true);
+                  setActionError("");
                 }}
+                className="rounded p-1 text-slate-600 hover:bg-slate-200"
+                title="Create file"
               >
-                <input
-                  autoFocus
-                  type="text"
-                  value={newFileName}
-                  onChange={(event) => {
-                    setNewFileName(event.target.value);
-                    setActionError("");
+                <PlusSquare size={16} />
+              </button>
+            </div>
+
+            <div className="flex min-h-0 flex-1 flex-col p-2">
+              {showFileInput && (
+                <form
+                  className="mb-2 shrink-0 space-y-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    handleCreateFile();
                   }}
-                  placeholder="File name, e.g. main.py"
-                  className="w-full rounded-md border border-slate-300 bg-white px-2 py-2 text-xs outline-none focus:border-slate-500"
-                />
-                <div className="flex gap-2">
-                  <button
-                    type="submit"
-                    className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white"
-                  >
-                    Create
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setShowFileInput(false);
-                      setNewFileName("");
+                >
+                  <input
+                    autoFocus
+                    type="text"
+                    value={newFileName}
+                    onChange={(event) => {
+                      setNewFileName(event.target.value);
                       setActionError("");
                     }}
-                    className="rounded-md border border-slate-300 px-3 py-1.5 text-xs"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </form>
-            )}
-
-            <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
-              {files.map((file) => (
-                <div
-                  key={file.id}
-                  onClick={() => setActiveFileId(file.id)}
-                  className={`group flex cursor-pointer items-center justify-between rounded-md px-2 py-2 text-sm ${
-                    activeFileId === file.id
-                      ? "bg-slate-200 text-slate-900"
-                      : "text-slate-600 hover:bg-slate-100"
-                  }`}
-                >
-                  <div className="flex min-w-0 items-center gap-2">
-                    <FileCode2 size={15} className="shrink-0" />
-                    <span className="truncate">{file.name}</span>
-                  </div>
-                  {files.length > 1 && (
+                    placeholder="File name, e.g. main.py"
+                    className="w-full rounded-md border border-slate-300 bg-white px-2 py-2 text-xs outline-none focus:border-slate-500"
+                  />
+                  <div className="flex gap-2">
                     <button
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        handleDeleteFile(file.id);
-                      }}
-                      className="hidden rounded p-1 text-slate-500 hover:bg-red-100 hover:text-red-700 group-hover:block"
-                      title="Delete file"
+                      type="submit"
+                      className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white"
                     >
-                      <Trash2 size={13} />
+                      Create
                     </button>
-                  )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowFileInput(false);
+                        setNewFileName("");
+                        setActionError("");
+                      }}
+                      className="rounded-md border border-slate-300 px-3 py-1.5 text-xs"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <div
+                className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1"
+                style={{ scrollbarWidth: "thin", scrollbarColor: "#94A3B8 #F1F5F9" }}
+              >
+                {files.map((file) => (
+                  <div
+                    key={file.id}
+                    onClick={() => {
+                    setEditorFocused(false);
+                    setActiveFileId(file.id);
+                  }}
+                    className={`group flex cursor-pointer items-center justify-between rounded-md px-2 py-2 text-sm ${
+                      activeFileId === file.id
+                        ? "bg-slate-200 text-slate-900"
+                        : "text-slate-600 hover:bg-slate-100"
+                    }`}
+                  >
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FileCode2 size={15} className="shrink-0" />
+                      <span className="truncate">{file.name}</span>
+                    </div>
+                    {files.length > 1 && (
+                      <button
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleDeleteFile(file.id);
+                        }}
+                        className="hidden rounded p-1 text-slate-500 hover:bg-red-100 hover:text-red-700 group-hover:block"
+                        title="Delete file"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {files.length === 0 && (
+                  <p className="px-2 py-3 text-xs text-slate-400">
+                    No project files yet.
+                  </p>
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section className="flex min-h-0 flex-1 flex-col">
+            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-3 py-3">
+              <span className="text-xs font-semibold text-slate-600">PARTICIPANTS</span>
+              <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-700">
+                {participants.length} online
+              </span>
+            </div>
+
+            <div
+              className="min-h-0 flex-1 space-y-1 overflow-y-auto p-2 pr-1"
+              style={{ scrollbarWidth: "thin", scrollbarColor: "#94A3B8 #F1F5F9" }}
+            >
+              {participants.map((participant) => (
+                <div
+                  key={participant.clientId}
+                  title={`${participant.name}: ${participant.activityLabel}`}
+                  className="flex min-w-0 items-center gap-2 rounded-md px-2 py-2 hover:bg-slate-100"
+                >
+                  <span
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-xs font-semibold text-white"
+                    style={{ backgroundColor: participant.color }}
+                  >
+                    {(participant.id === guestIdentityRef.current?.id
+                      ? "You"
+                      : participant.name
+                    ).slice(0, 1).toUpperCase()}
+                  </span>
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="truncate text-sm font-semibold text-slate-800">
+                      {participant.id === guestIdentityRef.current?.id
+                        ? "You"
+                        : participant.name}
+                    </span>
+                    <span className="truncate text-xs text-slate-500">
+                      {participant.activityLabel}
+                    </span>
+                  </span>
+                  <span
+                    className="h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-500"
+                    title="Online"
+                  />
                 </div>
               ))}
+
+              {participants.length === 0 && (
+                <p className="px-2 py-3 text-xs text-slate-400">
+                  Waiting for participants...
+                </p>
+              )}
             </div>
-          </div>
+          </section>
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-2">
             <div className="flex items-center gap-1 py-1">
               <button
-                onClick={() => setActiveWorkspace("editor")}
+                onClick={() => { setEditorFocused(false); setActiveWorkspace("editor"); }}
                 className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium ${
                   activeWorkspace === "editor"
                     ? "bg-slate-900 text-white"
@@ -924,7 +1606,7 @@ function App() {
                 Editor
               </button>
               <button
-                onClick={() => setActiveWorkspace("whiteboard")}
+                onClick={() => { setEditorFocused(false); setActiveWorkspace("whiteboard"); }}
                 className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium ${
                   activeWorkspace === "whiteboard"
                     ? "bg-slate-900 text-white"
@@ -936,11 +1618,40 @@ function App() {
               </button>
             </div>
 
-            <span className="truncate px-2 text-xs text-slate-500">
-              {activeWorkspace === "editor"
-                ? `${activeFile?.name || "main.js"} · ${activeFile?.language || "JavaScript"}`
-                : "Shared canvas"}
-            </span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="hidden truncate px-2 text-xs text-slate-500 sm:block">
+                {activeWorkspace === "editor"
+                  ? `${activeFile?.name || "main.js"} · ${activeFile?.language || "JavaScript"}`
+                  : "Shared canvas"}
+              </span>
+              {activeWorkspace === "editor" && (
+                <>
+                  <button
+                    onClick={() => setTerminalOpen((open) => !open)}
+                    className={`flex items-center gap-1.5 rounded-md border px-2.5 py-2 text-xs font-medium ${
+                      terminalOpen
+                        ? "border-slate-400 bg-slate-100 text-slate-900"
+                        : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <TerminalSquare size={14} />
+                    Terminal
+                  </button>
+                  <button
+                    onClick={handleRunCode}
+                    disabled={isRunning || !editorReady || !activeFile}
+                    className="flex items-center gap-1.5 rounded-md bg-emerald-700 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {isRunning ? (
+                      <LoaderCircle size={14} className="animate-spin" />
+                    ) : (
+                      <Play size={14} />
+                    )}
+                    {isRunning ? "Running" : "Run"}
+                  </button>
+                </>
+              )}
+            </div>
           </div>
 
           <div
@@ -973,6 +1684,90 @@ function App() {
               <span>{activeFile?.language || "JavaScript"}</span>
               <span>UTF-8 · LF</span>
             </div>
+
+            {terminalOpen && (
+              <section className="flex h-60 shrink-0 flex-col border-t border-slate-300 bg-white">
+                <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-3 py-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-700">
+                    <TerminalSquare size={14} />
+                    TERMINAL OUTPUT
+                    {isRunning && (
+                      <span className="font-normal text-amber-700">Running...</span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={() => {
+                        setRunOutput(null);
+                        setRunError("");
+                      }}
+                      className="text-xs text-slate-500 hover:text-slate-900"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      onClick={() => setTerminalOpen(false)}
+                      className="rounded p-1 text-slate-500 hover:bg-slate-100"
+                      aria-label="Close terminal"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-hidden p-3 md:grid-cols-[minmax(0,1fr)_220px]">
+                  <div className="min-h-0 overflow-y-auto rounded-md bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100">
+                    {runError && (
+                      <pre className="whitespace-pre-wrap break-words text-red-300">
+                        {runError}
+                      </pre>
+                    )}
+                    {!runError && !runOutput && (
+                      <p className="text-slate-400">
+                        Run your code to see the output here.
+                      </p>
+                    )}
+                    {runOutput && (
+                      <>
+                        {runOutput.stdout ? (
+                          <pre className="whitespace-pre-wrap break-words">
+                            {runOutput.stdout}
+                          </pre>
+                        ) : null}
+                        {runOutput.stderr ? (
+                          <pre className="mt-2 whitespace-pre-wrap break-words text-red-300">
+                            {runOutput.stderr}
+                          </pre>
+                        ) : null}
+                        {!runOutput.stdout && !runOutput.stderr && (
+                          <p className="text-slate-400">No output.</p>
+                        )}
+                        <div className="mt-3 border-t border-slate-700 pt-2 text-slate-400">
+                          Exit code: {runOutput.exit_code}
+                          {" · "}
+                          {runOutput.execution_time_ms} ms
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="flex min-h-0 flex-col gap-2">
+                    <label className="text-xs font-medium text-slate-600">
+                      Standard input (stdin)
+                    </label>
+                    <textarea
+                      value={stdinInput}
+                      onChange={(event) => setStdinInput(event.target.value)}
+                      placeholder="Enter input for your program..."
+                      className="min-h-0 flex-1 resize-none rounded-md border border-slate-300 p-2 font-mono text-xs outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-300"
+                    />
+                    <p className="text-[11px] leading-4 text-slate-500">
+                      Input is sent when you click Run.
+                    </p>
+                  </div>
+                </div>
+              </section>
+            )}
           </div>
 
           {activeWorkspace === "whiteboard" && (
@@ -994,7 +1789,8 @@ function App() {
           {actionError}
         </p>
       )}
-    </main>
+      </main>
+    </>
   );
 
 }
