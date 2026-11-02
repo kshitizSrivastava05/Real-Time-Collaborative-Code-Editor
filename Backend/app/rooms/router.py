@@ -33,3 +33,14 @@ def get_room(room_id: str):
         "message": "Room found",
         "room_id": room_id
     }
+
+# Delete if a room exists
+@room_router.delete("/{room_id}")
+def deltete_room(room_id: str):
+    if controller.delete_room(room_id):
+        return {
+                "message": "Room deleted successfully",
+                "room_id": room_id
+            }
+    
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,detail="Room Not Found")
