@@ -24,6 +24,8 @@ import {
   X,
   LoaderCircle,
   Users,
+  MessageSquare,
+  Send,
 } from "lucide-react";
 
 function destroyMonacoBinding(bindingRef) {
@@ -273,6 +275,21 @@ function getRoomRequestHeaders(json = false) {
 }
 
 
+function getLanguageLabel(language) {
+  const labels = {
+    java: "Java",
+    python: "Python",
+    cpp: "C++",
+    c: "C",
+  };
+  return labels[language] || language || "Plain Text";
+}
+
+function getMonacoLanguage(language) {
+  // Monaco uses its C/C++ language service for both .c and .cpp files.
+  return language === "c" ? "cpp" : language;
+}
+
 function App() {
   const roomId = new URLSearchParams(window.location.search).get("room");
 
@@ -295,10 +312,18 @@ function App() {
   const [copied, setCopied] = useState(false);
   const [activeWorkspace, setActiveWorkspace] = useState("editor");
   const [terminalOpen, setTerminalOpen] = useState(false);
-  const [stdinInput, setStdinInput] = useState("");
-  const [runOutput, setRunOutput] = useState(null);
-  const [runError, setRunError] = useState("");
+  const [terminalInput, setTerminalInput] = useState("");
+  const [terminalOutput, setTerminalOutput] = useState("");
+  const [executionStatus, setExecutionStatus] = useState("idle");
   const [isRunning, setIsRunning] = useState(false);
+
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatStatus, setChatStatus] = useState("disconnected");
+  const [chatError, setChatError] = useState("");
+  const [chatConnectionVersion, setChatConnectionVersion] = useState(0);
+  const [chatUserId, setChatUserId] = useState("");
 
   const [files, setFiles] = useState([]);
 
@@ -313,6 +338,12 @@ function App() {
   const ydocRef = useRef(null);
   const providerRef = useRef(null);
   const guestIdentityRef = useRef(null);
+  const executionSocketRef = useRef(null);
+  const terminalOutputRef = useRef(null);
+  const terminalInputRef = useRef(null);
+  const chatSocketRef = useRef(null);
+  const chatMessagesEndRef = useRef(null);
+  const chatInputRef = useRef(null);
   const [editorFocused, setEditorFocused] = useState(false);
 
   const activeFile = files.find((file) => file.id === activeFileId);
@@ -350,24 +381,25 @@ function App() {
       : "";
 
     const languageMap = {
-      js: "javascript",
-      jsx: "javascript",
-      ts: "typescript",
-      tsx: "typescript",
       py: "python",
       java: "java",
-      html: "html",
-      css: "css",
-      json: "json",
-      md: "markdown",
       cpp: "cpp",
       c: "c",
     };
 
+    const language = languageMap[extension];
+
+    if (!language) {
+      setActionError(
+        "Supported files: .java, .py, .cpp and .c. Please use one of these extensions."
+      );
+      return;
+    }
+
     const newFile = {
       id: crypto.randomUUID(),
       name,
-      language: languageMap[extension] || "plaintext",
+      language,
       content: "",
     };
 
@@ -598,7 +630,49 @@ function App() {
     }
   };
 
+  const handleSendChatMessage = (event) => {
+    event?.preventDefault();
+
+    const content = chatDraft.trim();
+    const socket = chatSocketRef.current;
+
+    if (!content || !socket || socket.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    socket.send(
+      JSON.stringify({
+        type: "message",
+        content,
+      })
+    );
+
+    setChatDraft("");
+    chatInputRef.current?.focus();
+  };
+
+  const handleChatInputKeyDown = (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSendChatMessage();
+    }
+  };
+
+  const reconnectChat = () => {
+    const socket = chatSocketRef.current;
+    if (socket) {
+      socket.close();
+      chatSocketRef.current = null;
+    }
+
+    setChatStatus("connecting");
+    setChatError("");
+    setChatConnectionVersion((version) => version + 1);
+  };
+
   const handleBackHome = () => {
+    const socket = chatSocketRef.current;
+    if (socket) socket.close(1000, "Leaving room");
     window.location.href = "/";
   };
 
@@ -615,6 +689,13 @@ function App() {
       setActionError("Unable to copy room ID. Please copy it manually.");
     }
   };
+
+  useEffect(() => {
+    const terminal = terminalOutputRef.current;
+    if (terminal) {
+      terminal.scrollTop = terminal.scrollHeight;
+    }
+  }, [terminalOutput]);
 
   useEffect(() => {
     if (roomId) return;
@@ -764,76 +845,311 @@ function App() {
     setEditorReady(true);
   };
 
-  const handleRunCode = async () => {
-    setTerminalOpen(true);
-    setRunError("");
-    setRunOutput(null);
+  const appendTerminalOutput = (text) => {
+    if (!text) return;
+    setTerminalOutput((current) => current + text);
+  };
 
+  const stopExecution = (closeSocket = true) => {
+    const socket = executionSocketRef.current;
+
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "stop" }));
+    }
+
+    if (closeSocket && socket) {
+      socket.close();
+      executionSocketRef.current = null;
+    }
+
+    setIsRunning(false);
+    setExecutionStatus("stopped");
+  };
+
+  const handleRunCode = () => {
     const language = activeFile?.language;
-    const supportedLanguages = ["python", "java", "javascript"];
+    const supportedLanguages = ["java", "python", "cpp", "c"];
+
+    setTerminalOpen(true);
+    setTerminalOutput("");
+    setTerminalInput("");
 
     if (!supportedLanguages.includes(language)) {
-      setRunError(
-        `Running ${language || "this file type"} is not supported yet. Supported languages: Python, Java and JavaScript.`
+      appendTerminalOutput(
+        `Unsupported file language. Use Java, Python, C++ or C.\n`
       );
+      setExecutionStatus("error");
       return;
     }
 
     const sourceExtension = activeFile?.name?.split(".").pop()?.toLowerCase();
     const expectedExtension = {
-      python: "py",
       java: "java",
-      javascript: "js",
+      python: "py",
+      cpp: "cpp",
+      c: "c",
     }[language];
 
     if (sourceExtension !== expectedExtension) {
-      setRunError(
-        `The ${language} runner requires a .${expectedExtension} file.`
+      appendTerminalOutput(
+        `The ${getLanguageLabel(language)} runner requires a .${expectedExtension} file.\n`
       );
+      setExecutionStatus("error");
       return;
     }
 
     const currentCode = editorRef.current?.getValue();
 
     if (!currentCode?.trim()) {
-      setRunError("There is no code to run.");
+      appendTerminalOutput("There is no code to run.\n");
+      setExecutionStatus("error");
       return;
     }
 
-    setIsRunning(true);
+    const previousSocket = executionSocketRef.current;
+    if (previousSocket) {
+      if (previousSocket.readyState === WebSocket.OPEN) {
+        previousSocket.send(JSON.stringify({ type: "stop" }));
+      }
+      previousSocket.close();
+      executionSocketRef.current = null;
+    }
 
-    try {
-      const response = await fetch("http://127.0.0.1:8000/execute", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
+    setIsRunning(true);
+    setExecutionStatus("connecting");
+    appendTerminalOutput(
+      `[co.lab] Starting ${getLanguageLabel(language)} program...\n`
+    );
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socketUrl = `${protocol}//${window.location.hostname}:8000/execute/ws`;
+    const socket = new WebSocket(socketUrl);
+    executionSocketRef.current = socket;
+
+    socket.onopen = () => {
+      setExecutionStatus("running");
+      socket.send(
+        JSON.stringify({
+          type: "run",
           language,
           filename: activeFile.name,
           code: currentCode,
-          stdin: stdinInput,
-        }),
-      });
+        })
+      );
+      terminalInputRef.current?.focus();
+    };
 
-      const result = await response.json().catch(() => ({}));
+    socket.onmessage = (event) => {
+      let message;
 
-      if (!response.ok) {
-        throw new Error(
-          result.detail || result.message || "Code execution failed."
-        );
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        appendTerminalOutput(event.data);
+        return;
       }
 
-      setRunOutput(result);
-    } catch (error) {
-      setRunError(
-        error.message ||
-          "Could not connect to the execution service. Check that FastAPI and Docker are running."
+      if (message.type === "started") {
+        setExecutionStatus("running");
+        return;
+      }
+
+      if (message.type === "output") {
+        appendTerminalOutput(message.data || "");
+        return;
+      }
+
+      if (message.type === "error") {
+        appendTerminalOutput(`\n[Error] ${message.message || "Execution failed."}\n`);
+        setExecutionStatus("error");
+        setIsRunning(false);
+        return;
+      }
+
+      if (message.type === "exit") {
+        appendTerminalOutput(
+          `\n[Process exited with code ${message.exit_code}]` +
+            (message.execution_time_ms != null
+              ? ` (${message.execution_time_ms} ms)`
+              : "") +
+            "\n"
+        );
+        setExecutionStatus(
+          message.exit_code === 0 ? "finished" : "error"
+        );
+        setIsRunning(false);
+        executionSocketRef.current = null;
+      }
+    };
+
+    socket.onerror = () => {
+      appendTerminalOutput(
+        "\n[Connection error] Could not connect to the execution service. Check FastAPI and Docker.\n"
       );
-    } finally {
+      setExecutionStatus("error");
       setIsRunning(false);
+    };
+
+    socket.onclose = () => {
+      if (executionSocketRef.current === socket) {
+        executionSocketRef.current = null;
+        setIsRunning(false);
+        setExecutionStatus((current) =>
+          current === "running" || current === "connecting"
+            ? "disconnected"
+            : current
+        );
+      }
+    };
+  };
+
+  const handleTerminalInputKeyDown = (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+
+      const socket = executionSocketRef.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !isRunning) {
+        return;
+      }
+
+      const line = terminalInput;
+      socket.send(
+        JSON.stringify({
+          type: "stdin",
+          data: `${line}\n`,
+        })
+      );
+
+      // Echo the typed input into the same terminal stream, like a terminal.
+      appendTerminalOutput(`${line}\n`);
+      setTerminalInput("");
+      return;
+    }
+
+    if (event.key.toLowerCase() === "c" && event.ctrlKey) {
+      event.preventDefault();
+      appendTerminalOutput("^C\n");
+      stopExecution();
     }
   };
+
+  const handleTerminalClose = () => {
+    if (isRunning) stopExecution();
+    setTerminalOpen(false);
+  };
+
+  useEffect(() => {
+    if (!roomId || !roomValid || !chatOpen) {
+      return;
+    }
+
+    let disposed = false;
+    const profileId = getLocalProfileId();
+    const guestIdentity = getGuestIdentity();
+
+    setChatUserId(profileId);
+    setChatStatus("connecting");
+    setChatError("");
+    setChatMessages([]);
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams({
+      guest_id: profileId,
+      display_name: guestIdentity.name || "Guest",
+      display_color: guestIdentity.color || "#64748B",
+    });
+
+    const socketUrl =
+      `${protocol}//${window.location.hostname}:8000/ws/chat/` +
+      `${encodeURIComponent(roomId)}?${params.toString()}`;
+
+    const socket = new WebSocket(socketUrl);
+    chatSocketRef.current = socket;
+
+    socket.onopen = () => {
+      if (disposed) return;
+      setChatStatus("connected");
+      setChatError("");
+    };
+
+    socket.onmessage = (event) => {
+      if (disposed) return;
+
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+
+      if (payload.type === "history") {
+        setChatMessages(
+          Array.isArray(payload.messages) ? payload.messages : []
+        );
+        return;
+      }
+
+      if (payload.type === "message" && payload.message) {
+        setChatMessages((current) => {
+          if (current.some((item) => item.id === payload.message.id)) {
+            return current;
+          }
+
+          return [...current, payload.message];
+        });
+        return;
+      }
+
+      if (payload.type === "error") {
+        setChatError(payload.message || "Chat error.");
+      }
+    };
+
+    socket.onerror = () => {
+      if (disposed) return;
+      setChatStatus("error");
+      setChatError(
+        "Unable to connect to room chat. Check that the FastAPI chat router is registered."
+      );
+    };
+
+    socket.onclose = (event) => {
+      if (disposed) return;
+      chatSocketRef.current = null;
+
+      if (event.code === 1008) {
+        setChatStatus("error");
+        setChatError(
+          "You are not a member of this room. Join the room before opening chat."
+        );
+        return;
+      }
+
+      setChatStatus("disconnected");
+    };
+
+    return () => {
+      disposed = true;
+      if (chatSocketRef.current === socket) {
+        chatSocketRef.current = null;
+      }
+      if (
+        socket.readyState === WebSocket.OPEN ||
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        socket.close(1000, "Chat panel closed");
+      }
+    };
+  }, [roomId, roomValid, chatOpen, chatConnectionVersion]);
+
+  useEffect(() => {
+    if (!chatOpen || !chatMessagesEndRef.current) return;
+
+    chatMessagesEndRef.current.scrollIntoView({
+      behavior: "smooth",
+      block: "end",
+    });
+  }, [chatMessages, chatOpen]);
 
   useEffect(() => {
     if (!roomValid || !editorReady || !roomId) {
@@ -949,8 +1265,8 @@ function App() {
       if (yfiles.size === 0) {
         yfiles.set("main-file", {
           id: "main-file",
-          name: "main.js",
-          language: "javascript",
+          name: "Main.java",
+          language: "java",
         });
       }
 
@@ -960,7 +1276,10 @@ function App() {
         if (legacyText.length > 0) {
           mainText.insert(0, legacyText.toString());
         } else {
-          mainText.insert(0, "// Start writing your code here");
+          mainText.insert(
+            0,
+            'public class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello from co.lab");\n    }\n}'
+          );
         }
       }
 
@@ -1058,7 +1377,7 @@ function App() {
     if (!model || model.isDisposed()) {
       model = monacoRef.current.editor.createModel(
         ytext.toString(),
-        file.language || "plaintext",
+        getMonacoLanguage(file.language || "plaintext"),
         monacoRef.current.Uri.parse(
           `inmemory://co-lab/${encodeURIComponent(file.id)}`
         )
@@ -1067,7 +1386,7 @@ function App() {
     } else {
       monacoRef.current.editor.setModelLanguage(
         model,
-        file.language || "plaintext"
+        getMonacoLanguage(file.language || "plaintext")
       );
     }
 
@@ -1426,6 +1745,19 @@ function App() {
             {connectionStatus}
           </span>
           <button
+            type="button"
+            onClick={() => setChatOpen((open) => !open)}
+            className={`flex items-center gap-1.5 rounded-md border px-3 py-2 ${
+              chatOpen
+                ? "border-slate-800 bg-slate-900 text-white"
+                : "border-slate-300 text-slate-700 hover:bg-slate-50"
+            }`}
+            aria-pressed={chatOpen}
+          >
+            <MessageSquare size={14} />
+            Chat
+          </button>
+          <button
             onClick={handleCopyLink}
             className="flex items-center gap-1 rounded-md border border-slate-300 px-3 py-2 hover:bg-slate-50"
           >
@@ -1621,13 +1953,19 @@ function App() {
             <div className="flex min-w-0 items-center gap-2">
               <span className="hidden truncate px-2 text-xs text-slate-500 sm:block">
                 {activeWorkspace === "editor"
-                  ? `${activeFile?.name || "main.js"} · ${activeFile?.language || "JavaScript"}`
+                  ? `${activeFile?.name || "Main.java"} · ${getLanguageLabel(activeFile?.language)}`
                   : "Shared canvas"}
               </span>
               {activeWorkspace === "editor" && (
                 <>
                   <button
-                    onClick={() => setTerminalOpen((open) => !open)}
+                    onClick={() => {
+                      if (terminalOpen) {
+                        handleTerminalClose();
+                      } else {
+                        setTerminalOpen(true);
+                      }
+                    }}
                     className={`flex items-center gap-1.5 rounded-md border px-2.5 py-2 text-xs font-medium ${
                       terminalOpen
                         ? "border-slate-400 bg-slate-100 text-slate-900"
@@ -1662,7 +2000,7 @@ function App() {
             <div className="min-h-0 flex-1">
               <Editor
                 height="100%"
-                defaultLanguage="javascript"
+                defaultLanguage="java"
                 defaultValue=""
                 theme="vs-dark"
                 onMount={handleEditorMount}
@@ -1681,33 +2019,54 @@ function App() {
               />
             </div>
             <div className="flex shrink-0 justify-between border-t border-slate-700 bg-[#1E1E1E] px-3 py-1.5 text-xs text-slate-400">
-              <span>{activeFile?.language || "JavaScript"}</span>
+              <span>{getLanguageLabel(activeFile?.language)}</span>
               <span>UTF-8 · LF</span>
             </div>
 
             {terminalOpen && (
-              <section className="flex h-60 shrink-0 flex-col border-t border-slate-300 bg-white">
-                <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-3 py-2">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-700">
+              <section className="flex h-64 shrink-0 flex-col border-t border-slate-300 bg-[#0C0C0C]">
+                <div className="flex shrink-0 items-center justify-between border-b border-[#303030] bg-[#181818] px-3 py-2">
+                  <div className="flex items-center gap-2 text-xs font-semibold tracking-wide text-slate-300">
                     <TerminalSquare size={14} />
-                    TERMINAL OUTPUT
-                    {isRunning && (
-                      <span className="font-normal text-amber-700">Running...</span>
-                    )}
+                    TERMINAL
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                        executionStatus === "running"
+                          ? "bg-emerald-950 text-emerald-400"
+                          : executionStatus === "error"
+                            ? "bg-red-950 text-red-400"
+                            : "bg-slate-800 text-slate-400"
+                      }`}
+                    >
+                      {executionStatus === "running"
+                        ? "RUNNING"
+                        : executionStatus.toUpperCase()}
+                    </span>
                   </div>
                   <div className="flex items-center gap-3">
                     <button
-                      onClick={() => {
-                        setRunOutput(null);
-                        setRunError("");
-                      }}
-                      className="text-xs text-slate-500 hover:text-slate-900"
+                      type="button"
+                      onClick={() => setTerminalOutput("")}
+                      className="text-xs text-slate-400 hover:text-white"
                     >
                       Clear
                     </button>
+                    {isRunning && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          appendTerminalOutput("^C\n");
+                          stopExecution();
+                        }}
+                        className="text-xs text-red-400 hover:text-red-300"
+                      >
+                        Stop
+                      </button>
+                    )}
                     <button
-                      onClick={() => setTerminalOpen(false)}
-                      className="rounded p-1 text-slate-500 hover:bg-slate-100"
+                      type="button"
+                      onClick={handleTerminalClose}
+                      className="rounded p-1 text-slate-400 hover:bg-[#303030] hover:text-white"
                       aria-label="Close terminal"
                     >
                       <X size={14} />
@@ -1715,57 +2074,49 @@ function App() {
                   </div>
                 </div>
 
-                <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 overflow-hidden p-3 md:grid-cols-[minmax(0,1fr)_220px]">
-                  <div className="min-h-0 overflow-y-auto rounded-md bg-slate-950 p-3 font-mono text-xs leading-5 text-slate-100">
-                    {runError && (
-                      <pre className="whitespace-pre-wrap break-words text-red-300">
-                        {runError}
-                      </pre>
-                    )}
-                    {!runError && !runOutput && (
-                      <p className="text-slate-400">
-                        Run your code to see the output here.
-                      </p>
-                    )}
-                    {runOutput && (
-                      <>
-                        {runOutput.stdout ? (
-                          <pre className="whitespace-pre-wrap break-words">
-                            {runOutput.stdout}
-                          </pre>
-                        ) : null}
-                        {runOutput.stderr ? (
-                          <pre className="mt-2 whitespace-pre-wrap break-words text-red-300">
-                            {runOutput.stderr}
-                          </pre>
-                        ) : null}
-                        {!runOutput.stdout && !runOutput.stderr && (
-                          <p className="text-slate-400">No output.</p>
-                        )}
-                        <div className="mt-3 border-t border-slate-700 pt-2 text-slate-400">
-                          Exit code: {runOutput.exit_code}
-                          {" · "}
-                          {runOutput.execution_time_ms} ms
-                        </div>
-                      </>
-                    )}
-                  </div>
-
-                  <div className="flex min-h-0 flex-col gap-2">
-                    <label className="text-xs font-medium text-slate-600">
-                      Standard input (stdin)
-                    </label>
-                    <textarea
-                      value={stdinInput}
-                      onChange={(event) => setStdinInput(event.target.value)}
-                      placeholder="Enter input for your program..."
-                      className="min-h-0 flex-1 resize-none rounded-md border border-slate-300 p-2 font-mono text-xs outline-none focus:border-slate-500 focus:ring-1 focus:ring-slate-300"
-                    />
-                    <p className="text-[11px] leading-4 text-slate-500">
-                      Input is sent when you click Run.
-                    </p>
-                  </div>
+                <div
+                  ref={terminalOutputRef}
+                  className="min-h-0 flex-1 overflow-y-auto px-3 py-2 font-mono text-[13px] leading-5 text-[#D4D4D4]"
+                  style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}
+                >
+                  {terminalOutput || (
+                    <span className="text-slate-500">
+                      Press Run to start the program. Program output and errors will appear here.
+                    </span>
+                  )}
                 </div>
+
+                <form
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (terminalInput.trim() || terminalInput.length === 0) {
+                      handleTerminalInputKeyDown({
+                        key: "Enter",
+                        preventDefault: () => {},
+                        ctrlKey: false,
+                      });
+                    }
+                  }}
+                  className="flex shrink-0 items-center gap-2 border-t border-[#303030] px-3 py-2 font-mono"
+                >
+                  <span className="select-none text-emerald-400">&gt;</span>
+                  <input
+                    ref={terminalInputRef}
+                    type="text"
+                    value={terminalInput}
+                    onChange={(event) => setTerminalInput(event.target.value)}
+                    onKeyDown={handleTerminalInputKeyDown}
+                    disabled={!isRunning || executionStatus !== "running"}
+                    placeholder={
+                      isRunning
+                        ? "Type program input and press Enter..."
+                        : "Run a program to enter input..."
+                    }
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="min-w-0 flex-1 bg-transparent text-[13px] text-[#D4D4D4] outline-none placeholder:text-slate-600 disabled:cursor-not-allowed"
+                  />
+                </form>
               </section>
             )}
           </div>
@@ -1782,6 +2133,181 @@ function App() {
             </div>
           )}
         </div>
+
+        {chatOpen && (
+          <aside className="flex w-full max-w-sm shrink-0 flex-col border-l border-slate-200 bg-white sm:w-80">
+            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-3 py-3">
+              <div className="flex items-center gap-2">
+                <MessageSquare size={16} className="text-slate-700" />
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-800">
+                    Room Chat
+                  </h2>
+                  <p className="text-[11px] text-slate-500">
+                    Messages are visible to room members
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    chatStatus === "connected"
+                      ? "bg-emerald-500"
+                      : chatStatus === "connecting"
+                        ? "bg-amber-500"
+                        : "bg-red-500"
+                  }`}
+                  title={chatStatus}
+                />
+                <button
+                  type="button"
+                  onClick={() => setChatOpen(false)}
+                  className="rounded p-1 text-slate-500 hover:bg-slate-100"
+                  aria-label="Close room chat"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-3 py-3">
+              {chatStatus === "connecting" && (
+                <p className="mb-3 text-center text-xs text-slate-500">
+                  Connecting to room chat...
+                </p>
+              )}
+
+              {chatError && (
+                <div className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  <p>{chatError}</p>
+                  <button
+                    type="button"
+                    onClick={reconnectChat}
+                    className="mt-2 font-semibold underline"
+                  >
+                    Retry connection
+                  </button>
+                </div>
+              )}
+
+              {chatMessages.length === 0 && chatStatus === "connected" && (
+                <div className="flex h-full min-h-40 flex-col items-center justify-center text-center">
+                  <MessageSquare size={26} className="text-slate-300" />
+                  <p className="mt-2 text-sm font-medium text-slate-600">
+                    No messages yet
+                  </p>
+                  <p className="mt-1 max-w-52 text-xs text-slate-400">
+                    Start a conversation with everyone in this room.
+                  </p>
+                </div>
+              )}
+
+              <div className="space-y-4">
+                {chatMessages.map((message) => {
+                  const isOwnMessage = message.sender_id === chatUserId;
+
+                  return (
+                    <div
+                      key={message.id}
+                      className={`flex w-full ${isOwnMessage ? "justify-end" : "justify-start"}`}
+                    >
+                      <div
+                        className={`flex max-w-[88%] items-end gap-2 ${
+                          isOwnMessage ? "flex-row-reverse" : "flex-row"
+                        }`}
+                      >
+                        {!isOwnMessage && (
+                          <span
+                            className="mb-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white"
+                            style={{
+                              backgroundColor: message.sender_color || "#64748B",
+                            }}
+                            title={message.sender_name || "Guest"}
+                          >
+                            {(message.sender_name || "G").slice(0, 1).toUpperCase()}
+                          </span>
+                        )}
+
+                        <div
+                          className={`min-w-0 rounded-2xl px-3 py-2 shadow-sm ${
+                            isOwnMessage
+                              ? "rounded-br-sm bg-emerald-100 text-slate-800"
+                              : "rounded-bl-sm border border-slate-200 bg-white text-slate-800"
+                          }`}
+                        >
+                          {!isOwnMessage && (
+                            <p
+                              className="mb-1 text-[11px] font-semibold"
+                              style={{ color: message.sender_color || "#475569" }}
+                            >
+                              {message.sender_name || "Guest"}
+                            </p>
+                          )}
+
+                          <p className="whitespace-pre-wrap break-words text-sm leading-5">
+                            {message.content}
+                          </p>
+
+                          <div
+                            className={`mt-1 text-right text-[10px] ${
+                              isOwnMessage ? "text-slate-500" : "text-slate-400"
+                            }`}
+                          >
+                            {message.created_at
+                              ? new Date(message.created_at).toLocaleTimeString(
+                                  [],
+                                  { hour: "2-digit", minute: "2-digit" }
+                                )
+                              : ""}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                <div ref={chatMessagesEndRef} />
+              </div>
+            </div>
+
+            <form
+              onSubmit={handleSendChatMessage}
+              className="shrink-0 border-t border-slate-200 bg-white p-3"
+            >
+              <div className="rounded-lg border border-slate-300 bg-white p-2 focus-within:border-slate-500 focus-within:ring-1 focus-within:ring-slate-300">
+                <textarea
+                  ref={chatInputRef}
+                  rows={2}
+                  value={chatDraft}
+                  onChange={(event) => setChatDraft(event.target.value)}
+                  onKeyDown={handleChatInputKeyDown}
+                  disabled={chatStatus !== "connected"}
+                  maxLength={2000}
+                  placeholder={
+                    chatStatus === "connected"
+                      ? "Message everyone in this room..."
+                      : "Connect to chat to send a message..."
+                  }
+                  className="w-full resize-none bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
+                />
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-[10px] text-slate-400">
+                    Enter to send · Shift + Enter for a new line
+                  </span>
+                  <button
+                    type="submit"
+                    disabled={
+                      chatStatus !== "connected" || !chatDraft.trim()
+                    }
+                    className="flex items-center gap-1.5 rounded-md bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <Send size={12} />
+                    Send
+                  </button>
+                </div>
+              </div>
+            </form>
+          </aside>
+        )}
       </section>
 
       {actionError && (

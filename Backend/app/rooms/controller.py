@@ -112,3 +112,10 @@ def delete_room(room_id: str, requester_id: str) -> str:
 
         del active_rooms[room_id]
         return "deleted"
+
+
+def is_room_member(room_id: str, user_id: str) -> bool:
+    """Return whether this guest profile is a member of the requested room."""
+    with _rooms_lock:
+        room = active_rooms.get(room_id)
+        return bool(room and user_id in room["members"])
