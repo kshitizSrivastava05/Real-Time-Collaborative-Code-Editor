@@ -1,6 +1,9 @@
 {
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "pydantic": "^0.0.1-security",
+    "pydantic-settings": "^0.0.1-security",
+    "sqlalchemy": "^10.1.1",
     "tailwindcss": "^4.3.3"
   }
 }
